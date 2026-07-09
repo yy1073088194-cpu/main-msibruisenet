@@ -64,6 +64,29 @@ statistics, defect-vs-healthy separability (Cohen's d + pixel AUC), 9&rarr;3
 reconstruction error, apple-region band correlation, and a per-image audit
 (apple/defect pixel counts + which split each image is in).
 
+### Concrete-Autoencoder baseline (learnable band selection)
+
+`ConcreteSelect` (Balin et al., ICML 2019) is a drop-in sibling of the hard
+top-k `DiagonalBandGate`: same `band_gate` slot, same tau schedule, same
+`selected_bands.json` logging and deploy export. `configs/concrete_k3.yaml` is
+identical to `gate_k3.yaml` except `band_select_type: "concrete"`, so the
+comparison isolates the selection mechanism (concrete relaxation vs. hard
+top-k + straight-through) with no other confound.
+
+```bash
+# Paired multi-seed comparison for the paper table
+for s in 42 123 456 2024 7 13 99; do
+  python train.py --config configs/gate_k3.yaml     --seed $s --output_dir outputs/gate_k3_seed$s
+  python train.py --config configs/concrete_k3.yaml --seed $s --output_dir outputs/concrete_k3_seed$s
+done
+
+# Or as an extra arm in the batch runner
+bash run_gate_batch.sh --concrete
+```
+
+Aggregate with `aggregate_results.py` and run a paired test (Wilcoxon /
+paired t) on per-seed class-1 IoU — both arms share seeds, so runs are paired.
+
 ---
 
 ## Dataset

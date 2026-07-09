@@ -4,6 +4,8 @@ Modules:
     - SEBlock: Channel attention via global average pooling (Squeeze-and-Excitation).
     - SpectralConv1D: 1D convolution along the spectral (band) dimension.
     - DiagonalBandGate: Static hard top-k band selection at the network input.
+    - ConcreteSelect: Concrete-autoencoder-style differentiable band selection
+      (baseline; same interface as DiagonalBandGate, concrete/Gumbel relaxation).
 """
 
 import math
@@ -167,3 +169,103 @@ class DiagonalBandGate(nn.Module):
         mode = "random" if self.random_select else "learned"
         return (f"num_bands={self.num_bands}, k={self.k}, mode={mode}, "
                 f"tau={self.tau_start}->{self.tau_end}")
+
+
+class ConcreteSelect(nn.Module):
+    """Concrete-autoencoder-style differentiable band selection (Balin et al. 2019).
+
+    A drop-in sibling of :class:`DiagonalBandGate`: it also selects exactly ``k``
+    of ``num_bands`` input channels and exposes the same ``forward`` /
+    ``set_progress`` / ``selected_bands`` API, so it slots into the existing
+    ``band_gate`` position and inherits the per-epoch tau schedule, the
+    selected-bands logging (``selected_bands.json``) and the deploy export with
+    no other plumbing changes.
+
+    The ONLY thing that differs from the hard top-k + STE gate is the *relaxation*
+    of the discrete choice, which is exactly the variable this baseline isolates:
+
+        * DiagonalBandGate : one shared score vector, hard top-k, straight-through
+          (forward = hard k-hot).
+        * ConcreteSelect   : ``k`` independent Concrete / Gumbel-softmax selector
+          nodes; forward = soft convex weights that anneal to one-hot.
+
+    Node ``j`` holds logits ``alpha[j]`` over the ``B`` bands. In training::
+
+        w_j = softmax((alpha_j + gumbel) / tau)     # Concrete sample, sum_b w_jb = 1
+        m   = max_j w_j                             # per-band keep-mask (B,)
+        x'  = x * m                                 # B channels, ~k active
+
+    so gradients flow to every band and the mask sharpens to k-hot as ``tau`` -> 0.
+    At inference each node takes ``argmax(alpha_j)``; the distinct picks form the
+    hard k-hot mask, and any collisions are filled from the next-highest logits so
+    exactly ``k`` bands are always kept (identical output form to the gate, hence
+    the same exact-pruning deploy path).
+
+    Args:
+        num_bands: Number of input channels (= encoder ``in_channels``).
+        k: Number of bands to keep (1 <= k <= num_bands).
+        tau_start, tau_end: Temperature annealing endpoints (match the gate).
+        alpha_init_noise: Std of Gaussian logit init (breaks argmax ties).
+    """
+
+    def __init__(self, num_bands, k,
+                 tau_start=1.0, tau_end=0.05, alpha_init_noise=0.01):
+        super().__init__()
+        if not (1 <= k <= num_bands):
+            raise ValueError(f"k must be in [1, {num_bands}], got {k}")
+
+        self.num_bands = num_bands
+        self.k = k
+        self.tau_start = float(tau_start)
+        self.tau_end = float(tau_end)
+
+        self.alpha = nn.Parameter(alpha_init_noise * torch.randn(k, num_bands))
+
+        # Fully-annealed default so a freshly loaded model (e.g. eval.py without
+        # any set_progress call) behaves as deployment (hard selection).
+        self.register_buffer("_tau", torch.tensor(self.tau_end))
+
+    def set_progress(self, frac):
+        """Update tau for the current training progress (frac in [0, 1])."""
+        frac = float(min(max(frac, 0.0), 1.0))
+        cos = 0.5 * (1.0 + math.cos(math.pi * frac))  # 1 -> 0 as frac 0 -> 1
+        self._tau.fill_(self.tau_end + (self.tau_start - self.tau_end) * cos)
+
+    def _hard_indices(self):
+        """Distinct argmax per node, filled to exactly k from the global ranking."""
+        picks = torch.argmax(self.alpha, dim=1).tolist()
+        seen = []
+        for b in picks:
+            if b not in seen:
+                seen.append(int(b))
+        if len(seen) < self.k:
+            order = torch.argsort(self.alpha.max(dim=0).values,
+                                  descending=True).tolist()
+            for b in order:
+                if b not in seen:
+                    seen.append(int(b))
+                if len(seen) == self.k:
+                    break
+        return sorted(seen[:self.k])
+
+    def forward(self, x):
+        if self.training:
+            tau = self._tau.clamp_min(1e-4)
+            u = torch.rand_like(self.alpha).clamp_(1e-6, 1.0 - 1e-6)
+            gumbel = -torch.log(-torch.log(u))
+            w = torch.softmax((self.alpha + gumbel) / tau, dim=1)  # (k, B)
+            mask = w.max(dim=0).values                             # (B,)
+        else:
+            idx = self._hard_indices()
+            mask = torch.zeros(self.num_bands, device=x.device, dtype=x.dtype)
+            mask[idx] = 1.0
+        return x * mask.view(1, -1, 1, 1)
+
+    @torch.no_grad()
+    def selected_bands(self):
+        """Return the sorted list of kept band indices."""
+        return self._hard_indices()
+
+    def extra_repr(self):
+        return (f"num_bands={self.num_bands}, k={self.k}, "
+                f"tau={self.tau_start}->{self.tau_end}, mode=concrete")

@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from .encoder import MobileNetV2Encoder, MobileNetV3Encoder, EfficientNetB0Encoder
 from .decoder import UNetDecoder
-from .modules import SpectralConv1D, DiagonalBandGate
+from .modules import SpectralConv1D, DiagonalBandGate, ConcreteSelect
 
 
 ENCODERS = {
@@ -168,21 +168,39 @@ def build_model(cfg):
 
 
 def _build_band_gate(model_cfg, in_channels):
-    """Construct a prior-free DiagonalBandGate from config, or None if disabled.
+    """Construct an input-stage band selector from config, or None if disabled.
+
+    Both selectors sit in the same ``band_gate`` slot and share the
+    forward / set_progress / selected_bands API, so training scheduling, band
+    logging and deploy export are identical regardless of which is chosen.
 
     Config keys (under ``model``):
         use_band_gate: bool (default False)
+        band_select_type: "topk" (default, DiagonalBandGate) | "concrete"
+            (ConcreteSelect — concrete-autoencoder baseline)
         band_gate_k: int — number of bands to keep
         band_gate_tau_start / band_gate_tau_end — temperature anneal endpoints
-        band_gate_random_select: bool — freeze on a random k-subset (control)
+        band_gate_random_select: bool — freeze on a random k-subset (topk only)
     """
     if not model_cfg.get("use_band_gate", False):
         return None
 
-    return DiagonalBandGate(
-        num_bands=in_channels,
-        k=model_cfg.get("band_gate_k", 3),
-        tau_start=model_cfg.get("band_gate_tau_start", 1.0),
-        tau_end=model_cfg.get("band_gate_tau_end", 0.05),
-        random_select=model_cfg.get("band_gate_random_select", False),
+    select_type = model_cfg.get("band_select_type", "topk")
+    k = model_cfg.get("band_gate_k", 3)
+    tau_start = model_cfg.get("band_gate_tau_start", 1.0)
+    tau_end = model_cfg.get("band_gate_tau_end", 0.05)
+
+    if select_type == "concrete":
+        return ConcreteSelect(
+            num_bands=in_channels, k=k,
+            tau_start=tau_start, tau_end=tau_end,
+        )
+    if select_type == "topk":
+        return DiagonalBandGate(
+            num_bands=in_channels, k=k,
+            tau_start=tau_start, tau_end=tau_end,
+            random_select=model_cfg.get("band_gate_random_select", False),
+        )
+    raise ValueError(
+        f"Unknown band_select_type '{select_type}'. Available: topk, concrete"
     )

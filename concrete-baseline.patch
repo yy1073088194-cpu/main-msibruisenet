@@ -1,0 +1,392 @@
+From ae5c1517b6cbbe73936a2bf38ece341c76136351 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 9 Jul 2026 10:45:39 +0000
+Subject: [PATCH] Add Concrete-Autoencoder band-selection baseline
+ (ConcreteSelect)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a Concrete Autoencoder (Balin et al., ICML 2019) baseline for the
+learnable band gate, as a controlled comparison for SpecGate: same
+band_gate slot, same tau schedule, same selected_bands.json logging and
+deploy export — the only variable is the relaxation of the discrete
+choice (concrete/Gumbel-softmax selector nodes vs. hard top-k + STE).
+
+- model/modules.py: new ConcreteSelect module with the same
+  forward / set_progress / selected_bands API as DiagonalBandGate.
+  Training uses k Concrete selector nodes (soft max-over-nodes mask);
+  inference takes per-node argmax with collision fill-up so exactly k
+  distinct bands are kept (hard k-hot, same exact-pruning deploy path).
+- model/model.py: _build_band_gate dispatches on band_select_type
+  ("topk" default | "concrete") into the same band_gate slot.
+- configs/concrete_k3.yaml: identical to gate_k3.yaml except
+  band_select_type: "concrete", so the ablation is confound-free.
+- scripts/run_gate_batch.py: new --concrete flag adds a concrete arm
+  per (k, seed); comparison plots include it when runs exist.
+- run_gate_batch.sh / README.md: document the new baseline and the
+  paired multi-seed run recipe.
+
+Verified: config loads and diffs against gate_k3 only in the selector
+type; ConcreteSelect train/eval forward, tau anneal, gradient flow and
+collision fill-up (20k randomized cases) pass; full
+build_model -> forward -> get_selected_bands pipeline runs with
+concrete_k3.yaml.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01KB3nwJgrS2CGL457ygzX6t
+---
+ README.md                 |  23 +++++++++
+ configs/concrete_k3.yaml  |  33 ++++++++++++
+ model/model.py            |  36 ++++++++++----
+ model/modules.py          | 102 ++++++++++++++++++++++++++++++++++++++
+ run_gate_batch.sh         |   4 +-
+ scripts/run_gate_batch.py |  16 ++++--
+ 6 files changed, 200 insertions(+), 14 deletions(-)
+ create mode 100644 configs/concrete_k3.yaml
+
+diff --git a/README.md b/README.md
+index 6f3ab2d..bd4a6be 100644
+--- a/README.md
++++ b/README.md
+@@ -64,6 +64,29 @@ statistics, defect-vs-healthy separability (Cohen's d + pixel AUC), 9&rarr;3
+ reconstruction error, apple-region band correlation, and a per-image audit
+ (apple/defect pixel counts + which split each image is in).
+ 
++### Concrete-Autoencoder baseline (learnable band selection)
++
++`ConcreteSelect` (Balin et al., ICML 2019) is a drop-in sibling of the hard
++top-k `DiagonalBandGate`: same `band_gate` slot, same tau schedule, same
++`selected_bands.json` logging and deploy export. `configs/concrete_k3.yaml` is
++identical to `gate_k3.yaml` except `band_select_type: "concrete"`, so the
++comparison isolates the selection mechanism (concrete relaxation vs. hard
++top-k + straight-through) with no other confound.
++
++```bash
++# Paired multi-seed comparison for the paper table
++for s in 42 123 456 2024 7 13 99; do
++  python train.py --config configs/gate_k3.yaml     --seed $s --output_dir outputs/gate_k3_seed$s
++  python train.py --config configs/concrete_k3.yaml --seed $s --output_dir outputs/concrete_k3_seed$s
++done
++
++# Or as an extra arm in the batch runner
++bash run_gate_batch.sh --concrete
++```
++
++Aggregate with `aggregate_results.py` and run a paired test (Wilcoxon /
++paired t) on per-seed class-1 IoU — both arms share seeds, so runs are paired.
++
+ ---
+ 
+ ## Dataset
+diff --git a/configs/concrete_k3.yaml b/configs/concrete_k3.yaml
+new file mode 100644
+index 0000000..fbb5bd0
+--- /dev/null
++++ b/configs/concrete_k3.yaml
+@@ -0,0 +1,33 @@
++# Concrete-Autoencoder baseline: differentiable band selection with k Concrete
++# (Gumbel-softmax) selector nodes at the network input (Balin et al., ICML 2019).
++#
++# This is the learnable-band-selection BASELINE for SpecGate. It is IDENTICAL to
++# gate_k3.yaml in every respect (backbone, k, tau schedule, epochs, data, loss)
++# EXCEPT band_select_type: "concrete" — so the comparison isolates the selection
++# mechanism (concrete relaxation vs. hard top-k + straight-through) with no other
++# confound. Selected indices are written to <output_dir>/selected_bands.json,
++# exactly like the gate.
++_base: _defaults.yaml
++
++experiment_name: "concrete_k3"
++
++model:
++  num_classes: 2
++  encoder_name: "mobilenetv2"
++  encoder_pretrained: true
++  skip_module: "none"
++  use_spectral_conv: false
++
++  use_band_gate: true
++  band_select_type: "concrete"    # <-- the only change vs gate_k3.yaml
++  band_gate_k: 3
++  band_gate_tau_start: 1.0         # soft (explore) -> ...
++  band_gate_tau_end: 0.05          # ... near one-hot (commit), cosine annealed
++
++data:
++  num_channels: 15                 # auto-overridden per dataset by the batch runner
++  band_indices: null              # use all available bands (do NOT pre-select here)
++
++train:
++  num_epochs: 1000                 # SAME budget as gate/full for fairness
++  early_stopping_patience: 200
+diff --git a/model/model.py b/model/model.py
+index d0bd64d..1458644 100644
+--- a/model/model.py
++++ b/model/model.py
+@@ -13,7 +13,7 @@ import torch.nn.functional as F
+ 
+ from .encoder import MobileNetV2Encoder, MobileNetV3Encoder, EfficientNetB0Encoder
+ from .decoder import UNetDecoder
+-from .modules import SpectralConv1D, DiagonalBandGate
++from .modules import SpectralConv1D, DiagonalBandGate, ConcreteSelect
+ 
+ 
+ ENCODERS = {
+@@ -168,21 +168,39 @@ def build_model(cfg):
+ 
+ 
+ def _build_band_gate(model_cfg, in_channels):
+-    """Construct a prior-free DiagonalBandGate from config, or None if disabled.
++    """Construct an input-stage band selector from config, or None if disabled.
++
++    Both selectors sit in the same ``band_gate`` slot and share the
++    forward / set_progress / selected_bands API, so training scheduling, band
++    logging and deploy export are identical regardless of which is chosen.
+ 
+     Config keys (under ``model``):
+         use_band_gate: bool (default False)
++        band_select_type: "topk" (default, DiagonalBandGate) | "concrete"
++            (ConcreteSelect — concrete-autoencoder baseline)
+         band_gate_k: int — number of bands to keep
+         band_gate_tau_start / band_gate_tau_end — temperature anneal endpoints
+-        band_gate_random_select: bool — freeze on a random k-subset (control)
++        band_gate_random_select: bool — freeze on a random k-subset (topk only)
+     """
+     if not model_cfg.get("use_band_gate", False):
+         return None
+ 
+-    return DiagonalBandGate(
+-        num_bands=in_channels,
+-        k=model_cfg.get("band_gate_k", 3),
+-        tau_start=model_cfg.get("band_gate_tau_start", 1.0),
+-        tau_end=model_cfg.get("band_gate_tau_end", 0.05),
+-        random_select=model_cfg.get("band_gate_random_select", False),
++    select_type = model_cfg.get("band_select_type", "topk")
++    k = model_cfg.get("band_gate_k", 3)
++    tau_start = model_cfg.get("band_gate_tau_start", 1.0)
++    tau_end = model_cfg.get("band_gate_tau_end", 0.05)
++
++    if select_type == "concrete":
++        return ConcreteSelect(
++            num_bands=in_channels, k=k,
++            tau_start=tau_start, tau_end=tau_end,
++        )
++    if select_type == "topk":
++        return DiagonalBandGate(
++            num_bands=in_channels, k=k,
++            tau_start=tau_start, tau_end=tau_end,
++            random_select=model_cfg.get("band_gate_random_select", False),
++        )
++    raise ValueError(
++        f"Unknown band_select_type '{select_type}'. Available: topk, concrete"
+     )
+diff --git a/model/modules.py b/model/modules.py
+index 96abcc7..ff1d78e 100644
+--- a/model/modules.py
++++ b/model/modules.py
+@@ -4,6 +4,8 @@ Modules:
+     - SEBlock: Channel attention via global average pooling (Squeeze-and-Excitation).
+     - SpectralConv1D: 1D convolution along the spectral (band) dimension.
+     - DiagonalBandGate: Static hard top-k band selection at the network input.
++    - ConcreteSelect: Concrete-autoencoder-style differentiable band selection
++      (baseline; same interface as DiagonalBandGate, concrete/Gumbel relaxation).
+ """
+ 
+ import math
+@@ -167,3 +169,103 @@ class DiagonalBandGate(nn.Module):
+         mode = "random" if self.random_select else "learned"
+         return (f"num_bands={self.num_bands}, k={self.k}, mode={mode}, "
+                 f"tau={self.tau_start}->{self.tau_end}")
++
++
++class ConcreteSelect(nn.Module):
++    """Concrete-autoencoder-style differentiable band selection (Balin et al. 2019).
++
++    A drop-in sibling of :class:`DiagonalBandGate`: it also selects exactly ``k``
++    of ``num_bands`` input channels and exposes the same ``forward`` /
++    ``set_progress`` / ``selected_bands`` API, so it slots into the existing
++    ``band_gate`` position and inherits the per-epoch tau schedule, the
++    selected-bands logging (``selected_bands.json``) and the deploy export with
++    no other plumbing changes.
++
++    The ONLY thing that differs from the hard top-k + STE gate is the *relaxation*
++    of the discrete choice, which is exactly the variable this baseline isolates:
++
++        * DiagonalBandGate : one shared score vector, hard top-k, straight-through
++          (forward = hard k-hot).
++        * ConcreteSelect   : ``k`` independent Concrete / Gumbel-softmax selector
++          nodes; forward = soft convex weights that anneal to one-hot.
++
++    Node ``j`` holds logits ``alpha[j]`` over the ``B`` bands. In training::
++
++        w_j = softmax((alpha_j + gumbel) / tau)     # Concrete sample, sum_b w_jb = 1
++        m   = max_j w_j                             # per-band keep-mask (B,)
++        x'  = x * m                                 # B channels, ~k active
++
++    so gradients flow to every band and the mask sharpens to k-hot as ``tau`` -> 0.
++    At inference each node takes ``argmax(alpha_j)``; the distinct picks form the
++    hard k-hot mask, and any collisions are filled from the next-highest logits so
++    exactly ``k`` bands are always kept (identical output form to the gate, hence
++    the same exact-pruning deploy path).
++
++    Args:
++        num_bands: Number of input channels (= encoder ``in_channels``).
++        k: Number of bands to keep (1 <= k <= num_bands).
++        tau_start, tau_end: Temperature annealing endpoints (match the gate).
++        alpha_init_noise: Std of Gaussian logit init (breaks argmax ties).
++    """
++
++    def __init__(self, num_bands, k,
++                 tau_start=1.0, tau_end=0.05, alpha_init_noise=0.01):
++        super().__init__()
++        if not (1 <= k <= num_bands):
++            raise ValueError(f"k must be in [1, {num_bands}], got {k}")
++
++        self.num_bands = num_bands
++        self.k = k
++        self.tau_start = float(tau_start)
++        self.tau_end = float(tau_end)
++
++        self.alpha = nn.Parameter(alpha_init_noise * torch.randn(k, num_bands))
++
++        # Fully-annealed default so a freshly loaded model (e.g. eval.py without
++        # any set_progress call) behaves as deployment (hard selection).
++        self.register_buffer("_tau", torch.tensor(self.tau_end))
++
++    def set_progress(self, frac):
++        """Update tau for the current training progress (frac in [0, 1])."""
++        frac = float(min(max(frac, 0.0), 1.0))
++        cos = 0.5 * (1.0 + math.cos(math.pi * frac))  # 1 -> 0 as frac 0 -> 1
++        self._tau.fill_(self.tau_end + (self.tau_start - self.tau_end) * cos)
++
++    def _hard_indices(self):
++        """Distinct argmax per node, filled to exactly k from the global ranking."""
++        picks = torch.argmax(self.alpha, dim=1).tolist()
++        seen = []
++        for b in picks:
++            if b not in seen:
++                seen.append(int(b))
++        if len(seen) < self.k:
++            order = torch.argsort(self.alpha.max(dim=0).values,
++                                  descending=True).tolist()
++            for b in order:
++                if b not in seen:
++                    seen.append(int(b))
++                if len(seen) == self.k:
++                    break
++        return sorted(seen[:self.k])
++
++    def forward(self, x):
++        if self.training:
++            tau = self._tau.clamp_min(1e-4)
++            u = torch.rand_like(self.alpha).clamp_(1e-6, 1.0 - 1e-6)
++            gumbel = -torch.log(-torch.log(u))
++            w = torch.softmax((self.alpha + gumbel) / tau, dim=1)  # (k, B)
++            mask = w.max(dim=0).values                             # (B,)
++        else:
++            idx = self._hard_indices()
++            mask = torch.zeros(self.num_bands, device=x.device, dtype=x.dtype)
++            mask[idx] = 1.0
++        return x * mask.view(1, -1, 1, 1)
++
++    @torch.no_grad()
++    def selected_bands(self):
++        """Return the sorted list of kept band indices."""
++        return self._hard_indices()
++
++    def extra_repr(self):
++        return (f"num_bands={self.num_bands}, k={self.k}, "
++                f"tau={self.tau_start}->{self.tau_end}, mode=concrete")
+diff --git a/run_gate_batch.sh b/run_gate_batch.sh
+index 856595b..d411f4c 100755
+--- a/run_gate_batch.sh
++++ b/run_gate_batch.sh
+@@ -5,7 +5,8 @@
+ # For every dataset under DATA_ROOT (each a subfolder with images/ + masks/):
+ #   - auto-detect channel count C
+ #   - train gate (learned hard top-k), full input (M_{k=B}), and optionally a
+-#     random-k control, for each seed and each k
++#     random-k control and/or a Concrete-Autoencoder selection baseline
++#     (--concrete), for each seed and each k
+ #   - emit per-dataset comparison + selected-band charts and a cross-dataset
+ #     summary (does the gate help more on wider candidate ranges?)
+ #
+@@ -17,6 +18,7 @@
+ #   bash run_gate_batch.sh --dry_run             # list planned runs only
+ #   bash run_gate_batch.sh --plots_only          # rebuild charts from manifest
+ #   bash run_gate_batch.sh --seeds 42,123 --ks 2,3,4 --random_k
++#   bash run_gate_batch.sh --concrete            # add the Concrete-AE baseline arm
+ # ==============================================================================
+ 
+ set -e
+diff --git a/scripts/run_gate_batch.py b/scripts/run_gate_batch.py
+index 7e45fc2..bc25bae 100644
+--- a/scripts/run_gate_batch.py
++++ b/scripts/run_gate_batch.py
+@@ -172,6 +172,7 @@ def make_run_config(base_cfg, ds, mode, k, seed, epochs, image_dir, mask_dir):
+         m["use_band_gate"] = True
+         m["band_gate_k"] = k
+         m["band_gate_random_select"] = (mode == "random")
++        m["band_select_type"] = "concrete" if mode == "concrete" else "topk"
+ 
+     cfg["experiment_name"] = f"{ds['name']}__{run_tag(mode, k)}"
+     if epochs:
+@@ -298,8 +299,10 @@ def plot_dataset_comparison(ds, manifest, out_root, ks, seeds, random_k):
+                        label=f"full input (C={ds['C']}): {fm:.4f}")
+             ax.fill_between([min(ks) - 0.5, max(ks) + 0.5], fm - fs, fm + fs,
+                             color="#444", alpha=0.12)
+-        # gate (and random) vs k
++        # gate (and concrete / random baselines) vs k; modes with no runs in
++        # the manifest are skipped by the all-NaN check below
+         for mode, color, marker in [("gate", "#1f77b4", "o"),
++                                    ("concrete", "#2ca02c", "^"),
+                                     ("random", "#d62728", "s")]:
+             if mode == "random" and not random_k:
+                 continue
+@@ -420,7 +423,7 @@ def plot_cross_dataset(datasets, manifest, out_root, ks, seeds, summary_k):
+ # --------------------------------------------------------------------------- #
+ # Main
+ # --------------------------------------------------------------------------- #
+-def build_specs(datasets, seeds, ks, random_k):
++def build_specs(datasets, seeds, ks, random_k, concrete):
+     specs = []
+     for ds in datasets:
+         valid_ks = [k for k in ks if 1 <= k < ds["C"]]
+@@ -431,6 +434,8 @@ def build_specs(datasets, seeds, ks, random_k):
+             specs.append({"ds": ds, "mode": "full", "k": ds["C"], "seed": seed})
+             for k in valid_ks:
+                 specs.append({"ds": ds, "mode": "gate", "k": k, "seed": seed})
++                if concrete:
++                    specs.append({"ds": ds, "mode": "concrete", "k": k, "seed": seed})
+                 if random_k:
+                     specs.append({"ds": ds, "mode": "random", "k": k, "seed": seed})
+     return specs
+@@ -447,6 +452,9 @@ def main():
+                         help="Override num_epochs (gate and full share the same budget)")
+     parser.add_argument("--random_k", action="store_true",
+                         help="Also train a frozen random-k control per (k, seed)")
++    parser.add_argument("--concrete", action="store_true",
++                        help="Also train the Concrete-Autoencoder selection "
++                             "baseline (band_select_type=concrete) per (k, seed)")
+     parser.add_argument("--datasets", type=str, default=None,
+                         help="Comma list of subfolder names to restrict to")
+     parser.add_argument("--image_dir", type=str, default="images")
+@@ -485,14 +493,14 @@ def main():
+ 
+     print("=" * 70)
+     print(f" Gate batch | root={args.data_root} | seeds={seeds} | ks={ks} | "
+-          f"random_k={args.random_k}")
++          f"random_k={args.random_k} | concrete={args.concrete}")
+     print(f" Found {len(datasets)} datasets:")
+     for ds in datasets:
+         rng = f"{ds['range'][0]}-{ds['range'][1]}" if ds["range"] else "?"
+         print(f"   - {ds['name']}: C={ds['C']}, n={ds['n_samples']}, range={rng}")
+     print("=" * 70)
+ 
+-    specs = build_specs(datasets, seeds, ks, args.random_k)
++    specs = build_specs(datasets, seeds, ks, args.random_k, args.concrete)
+     print(f"Total training runs planned: {len(specs)}")
+ 
+     if args.dry_run:
+-- 
+2.43.0
+
