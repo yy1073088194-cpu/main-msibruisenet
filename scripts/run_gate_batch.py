@@ -172,6 +172,7 @@ def make_run_config(base_cfg, ds, mode, k, seed, epochs, image_dir, mask_dir):
         m["use_band_gate"] = True
         m["band_gate_k"] = k
         m["band_gate_random_select"] = (mode == "random")
+        m["band_select_type"] = "concrete" if mode == "concrete" else "topk"
 
     cfg["experiment_name"] = f"{ds['name']}__{run_tag(mode, k)}"
     if epochs:
@@ -298,8 +299,10 @@ def plot_dataset_comparison(ds, manifest, out_root, ks, seeds, random_k):
                        label=f"full input (C={ds['C']}): {fm:.4f}")
             ax.fill_between([min(ks) - 0.5, max(ks) + 0.5], fm - fs, fm + fs,
                             color="#444", alpha=0.12)
-        # gate (and random) vs k
+        # gate (and concrete / random baselines) vs k; modes with no runs in
+        # the manifest are skipped by the all-NaN check below
         for mode, color, marker in [("gate", "#1f77b4", "o"),
+                                    ("concrete", "#2ca02c", "^"),
                                     ("random", "#d62728", "s")]:
             if mode == "random" and not random_k:
                 continue
@@ -420,7 +423,7 @@ def plot_cross_dataset(datasets, manifest, out_root, ks, seeds, summary_k):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def build_specs(datasets, seeds, ks, random_k):
+def build_specs(datasets, seeds, ks, random_k, concrete):
     specs = []
     for ds in datasets:
         valid_ks = [k for k in ks if 1 <= k < ds["C"]]
@@ -431,6 +434,8 @@ def build_specs(datasets, seeds, ks, random_k):
             specs.append({"ds": ds, "mode": "full", "k": ds["C"], "seed": seed})
             for k in valid_ks:
                 specs.append({"ds": ds, "mode": "gate", "k": k, "seed": seed})
+                if concrete:
+                    specs.append({"ds": ds, "mode": "concrete", "k": k, "seed": seed})
                 if random_k:
                     specs.append({"ds": ds, "mode": "random", "k": k, "seed": seed})
     return specs
@@ -447,6 +452,9 @@ def main():
                         help="Override num_epochs (gate and full share the same budget)")
     parser.add_argument("--random_k", action="store_true",
                         help="Also train a frozen random-k control per (k, seed)")
+    parser.add_argument("--concrete", action="store_true",
+                        help="Also train the Concrete-Autoencoder selection "
+                             "baseline (band_select_type=concrete) per (k, seed)")
     parser.add_argument("--datasets", type=str, default=None,
                         help="Comma list of subfolder names to restrict to")
     parser.add_argument("--image_dir", type=str, default="images")
@@ -485,14 +493,14 @@ def main():
 
     print("=" * 70)
     print(f" Gate batch | root={args.data_root} | seeds={seeds} | ks={ks} | "
-          f"random_k={args.random_k}")
+          f"random_k={args.random_k} | concrete={args.concrete}")
     print(f" Found {len(datasets)} datasets:")
     for ds in datasets:
         rng = f"{ds['range'][0]}-{ds['range'][1]}" if ds["range"] else "?"
         print(f"   - {ds['name']}: C={ds['C']}, n={ds['n_samples']}, range={rng}")
     print("=" * 70)
 
-    specs = build_specs(datasets, seeds, ks, args.random_k)
+    specs = build_specs(datasets, seeds, ks, args.random_k, args.concrete)
     print(f"Total training runs planned: {len(specs)}")
 
     if args.dry_run:

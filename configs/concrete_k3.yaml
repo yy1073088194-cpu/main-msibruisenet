@@ -1,0 +1,33 @@
+# Concrete-Autoencoder baseline: differentiable band selection with k Concrete
+# (Gumbel-softmax) selector nodes at the network input (Balin et al., ICML 2019).
+#
+# This is the learnable-band-selection BASELINE for SpecGate. It is IDENTICAL to
+# gate_k3.yaml in every respect (backbone, k, tau schedule, epochs, data, loss)
+# EXCEPT band_select_type: "concrete" — so the comparison isolates the selection
+# mechanism (concrete relaxation vs. hard top-k + straight-through) with no other
+# confound. Selected indices are written to <output_dir>/selected_bands.json,
+# exactly like the gate.
+_base: _defaults.yaml
+
+experiment_name: "concrete_k3"
+
+model:
+  num_classes: 2
+  encoder_name: "mobilenetv2"
+  encoder_pretrained: true
+  skip_module: "none"
+  use_spectral_conv: false
+
+  use_band_gate: true
+  band_select_type: "concrete"    # <-- the only change vs gate_k3.yaml
+  band_gate_k: 3
+  band_gate_tau_start: 1.0         # soft (explore) -> ...
+  band_gate_tau_end: 0.05          # ... near one-hot (commit), cosine annealed
+
+data:
+  num_channels: 15                 # auto-overridden per dataset by the batch runner
+  band_indices: null              # use all available bands (do NOT pre-select here)
+
+train:
+  num_epochs: 1000                 # SAME budget as gate/full for fairness
+  early_stopping_patience: 200

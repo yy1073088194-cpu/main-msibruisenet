@@ -5,7 +5,8 @@
 # For every dataset under DATA_ROOT (each a subfolder with images/ + masks/):
 #   - auto-detect channel count C
 #   - train gate (learned hard top-k), full input (M_{k=B}), and optionally a
-#     random-k control, for each seed and each k
+#     random-k control and/or a Concrete-Autoencoder selection baseline
+#     (--concrete), for each seed and each k
 #   - emit per-dataset comparison + selected-band charts and a cross-dataset
 #     summary (does the gate help more on wider candidate ranges?)
 #
@@ -17,6 +18,7 @@
 #   bash run_gate_batch.sh --dry_run             # list planned runs only
 #   bash run_gate_batch.sh --plots_only          # rebuild charts from manifest
 #   bash run_gate_batch.sh --seeds 42,123 --ks 2,3,4 --random_k
+#   bash run_gate_batch.sh --concrete            # add the Concrete-AE baseline arm
 # ==============================================================================
 
 set -e
