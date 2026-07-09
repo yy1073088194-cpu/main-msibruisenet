@@ -29,5 +29,5 @@ data:
   band_indices: null              # use all available bands (do NOT pre-select here)
 
 train:
-  num_epochs: 1000                 # SAME budget as gate/full for fairness
-  early_stopping_patience: 200
+  num_epochs: 500                 # SAME budget as gate/full for fairness
+  early_stopping_patience: 150
