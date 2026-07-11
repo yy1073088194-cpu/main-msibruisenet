@@ -64,14 +64,19 @@ statistics, defect-vs-healthy separability (Cohen's d + pixel AUC), 9&rarr;3
 reconstruction error, apple-region band correlation, and a per-image audit
 (apple/defect pixel counts + which split each image is in).
 
-### Concrete-Autoencoder baseline (learnable band selection)
+### Concrete selector baseline (learnable band selection)
 
-`ConcreteSelect` (Balin et al., ICML 2019) is a drop-in sibling of the hard
-top-k `DiagonalBandGate`: same `band_gate` slot, same tau schedule, same
-`selected_bands.json` logging and deploy export. `configs/concrete_k3.yaml` is
-identical to `gate_k3.yaml` except `band_select_type: "concrete"`, so the
-comparison isolates the selection mechanism (concrete relaxation vs. hard
-top-k + straight-through) with no other confound.
+`ConcreteSelectorK` (supervised concrete selector, cf. Balin et al., ICML
+2019, Appendix G) sits in the same `band_gate` slot as the hard top-k
+`DiagonalBandGate` and shares its `set_progress` / `selected_bands` API and
+`selected_bands.json` logging. Mechanism: k Concrete/Gumbel-softmax selector
+nodes each pick one band; the output is **k channels** (a convex combination,
+magnitude-preserving — the encoder is automatically built with
+`in_channels=k`), and the temperature anneals exponentially T0=10.0 →
+TB=0.01 per the original paper. At inference each node takes its argmax band
+(collisions filled to exactly k distinct). `configs/concrete_k3.yaml` shares
+backbone, k, data and loss with `gate_k3.yaml`; the selection mechanism and
+its paper-faithful temperature schedule are what differ.
 
 ```bash
 # Paired multi-seed comparison for the paper table

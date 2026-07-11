@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from .encoder import MobileNetV2Encoder, MobileNetV3Encoder, EfficientNetB0Encoder
 from .decoder import UNetDecoder
-from .modules import SpectralConv1D, DiagonalBandGate, ConcreteSelect
+from .modules import SpectralConv1D, DiagonalBandGate, ConcreteSelectorK
 
 
 ENCODERS = {
@@ -38,7 +38,7 @@ class SegmentationModel(nn.Module):
                  skip_module="none", se_reduction=16,
                  use_spectral_conv=False, spectral_conv_kernel_size=3,
                  use_input_spectral_conv=False, input_spectral_conv_kernel_size=3,
-                 band_gate=None):
+                 band_gate=None, encoder_in_channels=None):
         super().__init__()
 
         # Optional static band-selection gate at the network input.
@@ -62,7 +62,10 @@ class SegmentationModel(nn.Module):
                 f"Unknown encoder '{encoder_name}'. "
                 f"Available: {list(ENCODERS.keys())}"
             )
-        self.encoder = encoder_cls(in_channels=in_channels, pretrained=pretrained,
+        # The encoder's input width may differ from the raw input width when the
+        # band gate changes the channel count (ConcreteSelectorK maps B -> k).
+        enc_in = encoder_in_channels if encoder_in_channels is not None else in_channels
+        self.encoder = encoder_cls(in_channels=enc_in, pretrained=pretrained,
                                    first_layer_pretrained=first_layer_pretrained)
 
         enc_channels = self.encoder.get_output_channels()
@@ -151,6 +154,15 @@ def build_model(cfg):
 
     in_channels = cfg["data"].get("num_channels", 9)
 
+    # ConcreteSelectorK outputs k channels (B -> k), so the encoder must be
+    # built for k inputs. The topk gate is width-preserving (B -> B).
+    # NOTE: with "concrete", use_input_spectral_conv / use_spectral_conv must
+    # stay False (they are sized for the raw B-channel input).
+    enc_in = in_channels
+    if (model_cfg.get("use_band_gate", False)
+            and model_cfg.get("band_select_type", "topk") == "concrete"):
+        enc_in = model_cfg.get("band_gate_k", 3)
+
     return SegmentationModel(
         num_classes=model_cfg.get("num_classes", 2),
         in_channels=in_channels,
@@ -164,6 +176,7 @@ def build_model(cfg):
         use_input_spectral_conv=model_cfg.get("use_input_spectral_conv", False),
         input_spectral_conv_kernel_size=model_cfg.get("input_spectral_conv_kernel_size", 3),
         band_gate=_build_band_gate(model_cfg, in_channels),
+        encoder_in_channels=enc_in,
     )
 
 
@@ -171,15 +184,18 @@ def _build_band_gate(model_cfg, in_channels):
     """Construct an input-stage band selector from config, or None if disabled.
 
     Both selectors sit in the same ``band_gate`` slot and share the
-    forward / set_progress / selected_bands API, so training scheduling, band
-    logging and deploy export are identical regardless of which is chosen.
+    set_progress / selected_bands API, so training scheduling and band logging
+    are identical regardless of which is chosen. They differ in output width:
+    topk preserves the B input channels, concrete outputs k channels (the
+    encoder is sized accordingly in ``build_model``).
 
     Config keys (under ``model``):
         use_band_gate: bool (default False)
         band_select_type: "topk" (default, DiagonalBandGate) | "concrete"
-            (ConcreteSelect — concrete-autoencoder baseline)
+            (ConcreteSelectorK — supervised concrete selector baseline)
         band_gate_k: int — number of bands to keep
         band_gate_tau_start / band_gate_tau_end — temperature anneal endpoints
+            (for concrete these are T0 / TB of the exponential schedule)
         band_gate_random_select: bool — freeze on a random k-subset (topk only)
     """
     if not model_cfg.get("use_band_gate", False):
@@ -191,9 +207,9 @@ def _build_band_gate(model_cfg, in_channels):
     tau_end = model_cfg.get("band_gate_tau_end", 0.05)
 
     if select_type == "concrete":
-        return ConcreteSelect(
+        return ConcreteSelectorK(
             num_bands=in_channels, k=k,
-            tau_start=tau_start, tau_end=tau_end,
+            tau_start=tau_start, tau_end=tau_end,  # tau_start=T0, tau_end=TB
         )
     if select_type == "topk":
         return DiagonalBandGate(
