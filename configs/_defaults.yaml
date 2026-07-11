@@ -11,7 +11,7 @@
 # ============================================================================
 
 data:
-  data_dir: "/root/autodl-tmp/datasets/185_9bands"
+  data_dir: "/root/autodl-tmp/datasets/185_15bands"
   image_dir: "images"
   mask_dir: "masks"
   num_channels: 15
@@ -25,7 +25,7 @@ data:
 
 train:
   batch_size: 32
-  num_epochs: 1000
+  num_epochs: 500
   optimizer: "adamw"
   lr: 5.0e-4
   weight_decay: 1.0e-4
