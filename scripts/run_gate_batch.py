@@ -173,6 +173,11 @@ def make_run_config(base_cfg, ds, mode, k, seed, epochs, image_dir, mask_dir):
         m["band_gate_k"] = k
         m["band_gate_random_select"] = (mode == "random")
         m["band_select_type"] = "concrete" if mode == "concrete" else "topk"
+        if mode == "concrete":
+            # Paper-faithful exponential schedule endpoints (T0 -> TB), not the
+            # gate's cosine 1.0 -> 0.05 inherited from the base config.
+            m["band_gate_tau_start"] = 10.0
+            m["band_gate_tau_end"] = 0.01
 
     cfg["experiment_name"] = f"{ds['name']}__{run_tag(mode, k)}"
     if epochs:

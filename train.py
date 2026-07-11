@@ -413,6 +413,8 @@ def train(cfg, seed, output_dir, splits=None):
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_iou_c1": best_iou_c1,
                 "config": cfg,
+                "selected_bands": (model.get_selected_bands()
+                                   if hasattr(model, "get_selected_bands") else None),
             }, os.path.join(ckpt_dir, "best_model.pth"))
         else:
             no_improve_count += 1
@@ -474,6 +476,13 @@ def train(cfg, seed, output_dir, splits=None):
         _f.write(f"final_epoch={epoch_logs[-1]['epoch'] if epoch_logs else 0}\n")
 
     # If a band gate was used, persist the deployment selection for Phase 2.
+    # Reload the BEST checkpoint first so the recorded selection matches the
+    # deployed model, not the (possibly drifted) last-epoch state.
+    best_ckpt_path = os.path.join(ckpt_dir, "best_model.pth")
+    if os.path.exists(best_ckpt_path):
+        _bc = torch.load(best_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(_bc["model_state_dict"])
+        model.eval()
     selected_bands = None
     if hasattr(model, "get_selected_bands"):
         selected_bands = model.get_selected_bands()

@@ -1,12 +1,14 @@
-# Concrete-Autoencoder baseline: differentiable band selection with k Concrete
-# (Gumbel-softmax) selector nodes at the network input (Balin et al., ICML 2019).
+# Concrete/Gumbel-softmax band-selection baseline (supervised concrete selector,
+# cf. Balin et al., ICML 2019, Appendix G): k selector nodes at the network
+# input, each picking one band; output is k channels (convex combination,
+# magnitude-preserving), with exponential temperature annealing T0 -> TB.
 #
-# This is the learnable-band-selection BASELINE for SpecGate. It is IDENTICAL to
-# gate_k3.yaml in every respect (backbone, k, tau schedule, epochs, data, loss)
-# EXCEPT band_select_type: "concrete" — so the comparison isolates the selection
-# mechanism (concrete relaxation vs. hard top-k + straight-through) with no other
-# confound. Selected indices are written to <output_dir>/selected_bands.json,
-# exactly like the gate.
+# This is the learnable-band-selection BASELINE for SpecGate. Same backbone,
+# k, data and loss as gate_k3.yaml; the selection mechanism differs (concrete
+# relaxation + k-channel output vs. hard top-k + straight-through B-channel
+# mask), and the temperature schedule follows the original paper (exponential
+# 10.0 -> 0.01 instead of the gate's cosine 1.0 -> 0.05). Selected indices are
+# written to <output_dir>/selected_bands.json, exactly like the gate.
 _base: _defaults.yaml
 
 experiment_name: "concrete_k3"
@@ -19,10 +21,10 @@ model:
   use_spectral_conv: false
 
   use_band_gate: true
-  band_select_type: "concrete"    # <-- the only change vs gate_k3.yaml
+  band_select_type: "concrete"
   band_gate_k: 3
-  band_gate_tau_start: 1.0         # soft (explore) -> ...
-  band_gate_tau_end: 0.05          # ... near one-hot (commit), cosine annealed
+  band_gate_tau_start: 10.0        # T0 (original warm start, exponential annealing)
+  band_gate_tau_end: 0.01          # TB
 
 data:
   num_channels: 15                 # auto-overridden per dataset by the batch runner
